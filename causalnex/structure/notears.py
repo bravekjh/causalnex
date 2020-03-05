@@ -551,3 +551,286 @@ def _learn_structure_lasso(
     w_new = w_est[: d ** 2].reshape([d, d]) - w_est[d ** 2 :].reshape([d, d])
     w_new[np.abs(w_new) < w_threshold] = 0
     return StructureModel(w_new.reshape([d, d]))
+
+
+## Shaan's functions
+
+def notears_l1(xmat: np.ndarray,
+               max_iter: int = 100,
+               h_tol: float = 1e-8,
+               w_threshold: float = 0.3,
+               lambda_1: float = 0.1) -> np.ndarray:
+    """Solve min_wmat ell(wmat; xmat) s.t. h_val(wmat) = 0 using augmented Lagrangian.
+    Args:
+        xmat: [n_rows,d_cols] sample matrix
+        max_iter: max number of dual ascent steps
+        h_tol: exit if |h_exp(w_vec)| <= h_tol
+        w_threshold: fixed threshold for edge weights
+        lambda_1: coefficient of l1 regularisation
+    Returns:
+        wmat_est: [d_cols,d_cols] estimate
+    """
+
+    def _h(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        return np.trace(slin.expm(wmat * wmat)) - d_cols
+
+    def _func(w_vec):
+        w_pos = w_vec[:d_cols ** 2]
+        w_neg = w_vec[d_cols ** 2:]
+
+        wmat_pos = w_pos.reshape([d_cols, d_cols])
+        wmat_neg = w_neg.reshape([d_cols, d_cols])
+
+        wmat = wmat_pos - wmat_neg
+
+        loss = 0.5 / n_rows * np.square(np.linalg.norm(xmat.dot(np.eye(d_cols, d_cols) - wmat), 'fro'))
+        h_val = _h(wmat)
+        return loss + 0.5 * rho * h_val * h_val + alpha * h_val + lambda_1 * np.linalg.norm(wmat.ravel(), 1)
+
+    def _grad(w_vec):
+        w_pos = w_vec[:d_cols ** 2]
+        w_neg = w_vec[d_cols ** 2:]
+
+        grad_vec = np.zeros(2 * d_cols ** 2)
+        wmat_pos = w_pos.reshape([d_cols, d_cols])
+        wmat_neg = w_neg.reshape([d_cols, d_cols])
+
+        wmat = wmat_pos - wmat_neg
+
+        loss_grad = - 1.0 / n_rows * xmat.T.dot(xmat).dot(np.eye(d_cols, d_cols) - wmat)
+        exp_hdmrd = slin.expm(wmat * wmat)
+        obj_grad = loss_grad + (rho * (np.trace(exp_hdmrd) - d_cols) + alpha) * exp_hdmrd.T * wmat * 2
+        lbd_grad = lambda_1 * np.ones(d_cols * d_cols)
+        grad_vec[:d_cols ** 2] = obj_grad.flatten() + lbd_grad
+        grad_vec[d_cols ** 2:] = -obj_grad.flatten() + lbd_grad
+        return grad_vec
+
+    n_rows, d_cols = xmat.shape
+    w_est, w_new = np.zeros(2 * d_cols * d_cols), np.zeros(2 * d_cols * d_cols)
+    rho, alpha, h_val, h_new = 1.0, 0.0, np.inf, np.inf
+    bnds = [(0, 0) if i == j else (0, None) for i in range(d_cols) for j in range(d_cols)] * 2
+    for n_iter in range(max_iter):
+        while rho < 1e+20:
+            sol = sopt.minimize(_func, w_est, method='L-BFGS-B', jac=_grad, bounds=bnds)
+            w_new = sol.x
+
+            h_new = _h(w_new[:d_cols ** 2].reshape([d_cols, d_cols]) - w_new[d_cols ** 2:].reshape([d_cols, d_cols]))
+            if h_new > 0.25 * h_val:
+                rho *= 10
+            else:
+                break
+        w_est, h_val = w_new, h_new
+        alpha += rho * h_val
+        if h_val <= h_tol:
+            break
+        if h_val > h_tol and n_iter == max_iter - 1:
+            warnings.warn("Failed to converge. Consider increasing max_iter.")
+
+    # print(_func(w_est))
+    # print(n_iter)
+    w_new = w_est[:d_cols ** 2].reshape([d_cols, d_cols]) - w_est[d_cols ** 2:].reshape([d_cols, d_cols])
+    w_new[np.abs(w_new) < w_threshold] = 0
+    return w_new
+
+
+def notears_binary(xmat: np.ndarray,
+                   max_iter: int = 100,
+                   h_tol: float = 1e-8,
+                   w_threshold: float = 0.3) -> np.ndarray:
+    """Solve min_wmat ell(wmat; xmat) s.t. h_val(wmat) = 0 using augmented Lagrangian.
+    Args:
+        xmat: [n_rows,d_cols] sample matrix
+        max_iter: max number of dual ascent steps
+        h_tol: exit if |h_exp(w_vec)| <= h_tol
+        w_threshold: fixed threshold for edge weights
+    Returns:
+        wmat_est: [d_cols,d_cols] estimate
+    """
+
+    def sigmoid(xmat):
+        return 1. / (1. + np.exp(-xmat))
+
+    def _h(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        return np.trace(slin.expm(wmat * wmat)) - d_cols
+
+    def _func(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        sig = sigmoid(np.dot(xmat, wmat))
+        loss = 1. / n_rows * np.sum(-np.diag(xmat.T.dot(np.log(sig)))
+                                    - np.diag((1 - xmat).T.dot(np.log(1 - sig))))
+        h_val = _h(wmat)
+        return loss + 0.5 * rho * h_val * h_val + alpha * h_val
+
+    def _grad(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        sig = sigmoid(np.dot(xmat, wmat))
+        loss_grad = 1.0 / n_rows * xmat.T.dot(sig - xmat)
+        exp_hdmrd = slin.expm(wmat * wmat)
+        obj_grad = loss_grad + (rho * (np.trace(exp_hdmrd) - d_cols) + alpha) * exp_hdmrd.T * wmat * 2
+        return obj_grad.flatten()
+
+    n_rows, d_cols = xmat.shape
+    w_est, w_new = np.zeros(d_cols * d_cols), np.zeros(d_cols * d_cols)
+    rho, alpha, h_val, h_new = 1.0, 0.0, np.inf, np.inf
+    bnds = [(0, 0) if i == j else (None, None) for i in range(d_cols) for j in range(d_cols)]
+    for n_iter in range(max_iter):
+        while rho < 1e+20:
+            sol = sopt.minimize(_func, w_est, method='L-BFGS-B', jac=_grad, bounds=bnds)
+            w_new = sol.x
+            h_new = _h(w_new)
+            if h_new > 0.25 * h_val:
+                rho *= 10
+            else:
+                break
+        w_est, h_val = w_new, h_new
+        alpha += rho * h_val
+        if h_val <= h_tol:
+            break
+        if h_val > h_tol and n_iter == max_iter - 1:
+            warnings.warn("Failed to converge. Consider increasing max_iter.")
+
+    w_est[np.abs(w_est) < w_threshold] = 0
+    return w_est.reshape([d_cols, d_cols])
+
+
+# pylint: disable=too-many-locals
+def notears_combo(xmat: np.ndarray,
+                  max_iter: int = 100,
+                  c_cols: int = None,
+                  h_tol: float = 1e-8,
+                  w_threshold: float = 0.3) -> np.ndarray:
+    """Solve min_wmat ell(wmat; xmat) s.t. h_val(wmat) = 0 using augmented Lagrangian.
+    Args:
+        xmat: [n_rows,d_cols] sample matrix
+        max_iter: max number of dual ascent steps
+        h_tol: exit if |h_exp(w_vec)| <= h_tol
+        w_threshold: fixed threshold for edge weights
+        c_cols: number of columns which are cts
+    Returns:
+        wmat_est: [d_cols,d_cols] estimate
+    """
+    xmat_c = xmat[:, :c_cols]
+    xmat_b = xmat[:, c_cols:]
+
+    def sigmoid(xmat):
+        return 1. / (1. + np.exp(-xmat))
+
+    def _h(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        return np.trace(slin.expm(wmat * wmat)) - d_cols
+
+    def _func(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        wmat_c = wmat[:, :c_cols]
+        wmat_b = wmat[:, c_cols:]
+
+        lin_loss = 0.5 / n_rows * np.square(np.linalg.norm(xmat_c - xmat @ wmat_c, 'fro'))
+
+        sig = sigmoid(np.dot(xmat, wmat_b))
+        log_loss = 1. / n_rows * np.sum(-np.diag(xmat_b.T.dot(np.log(sig)))
+                                        - np.diag((1 - xmat_b).T.dot(np.log(1 - sig))))
+        h_val = _h(wmat)
+        return lin_loss + log_loss + 0.5 * rho * h_val * h_val + alpha * h_val
+
+    def _grad(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        wmat_c = wmat[:, :c_cols]
+        wmat_b = wmat[:, c_cols:]
+
+        sig = sigmoid(np.dot(xmat, wmat_b))
+
+        lin_grad = - 1.0 / n_rows * xmat.T.dot(xmat_c - xmat.dot(wmat_c))
+        log_grad = 1.0 / n_rows * xmat.T.dot(sig - xmat_b)
+
+        loss_grad = np.concatenate((lin_grad, log_grad), axis=1)
+        exp_hdmrd = slin.expm(wmat * wmat)
+        obj_grad = loss_grad + (rho * (np.trace(exp_hdmrd) - d_cols) + alpha) * exp_hdmrd.T * wmat * 2
+        return obj_grad.flatten()
+
+    n_rows, d_cols = xmat.shape
+    w_est, w_new = np.zeros(d_cols * d_cols), np.zeros(d_cols * d_cols)
+    rho, alpha, h_val, h_new = 1.0, 0.0, np.inf, np.inf
+    bnds = [(0, 0) if i == j else (None, None) for i in range(d_cols) for j in range(d_cols)]
+    for n_iter in range(max_iter):
+        while rho < 1e+20:
+            sol = sopt.minimize(_func, w_est, method='L-BFGS-B', jac=_grad, bounds=bnds)
+            w_new = sol.x
+            h_new = _h(w_new)
+            if h_new > 0.25 * h_val:
+                rho *= 10
+            else:
+                break
+        w_est, h_val = w_new, h_new
+        alpha += rho * h_val
+        if h_val <= h_tol:
+            break
+        if h_val > h_tol and n_iter == max_iter - 1:
+            warnings.warn("Failed to converge. Consider increasing max_iter.")
+
+    w_est[np.abs(w_est) < w_threshold] = 0
+    return w_est.reshape([d_cols, d_cols])
+
+
+def notears_binary_l1(xmat: np.ndarray,
+                      max_iter: int = 100,
+                      h_tol: float = 1e-8,
+                      lambda1: float = 0.1,
+                      w_threshold: float = 0.0) -> np.ndarray:
+    """Solve min_wmat ell(wmat; xmat) s.t. h_val(wmat) = 0 using augmented Lagrangian.
+    Args:
+        xmat: [n_rows,d_cols] sample matrix
+        max_iter: max number of dual ascent steps
+        h_tol: exit if |h_exp(w_vec)| <= h_tol
+        lambda1: coefficient for l1 regularisation
+        w_threshold: fixed threshold for edge weights
+    Returns:
+        wmat_est: [d_cols,d_cols] estimate
+    """
+
+    def sigmoid(xmat):
+        return 1. / (1. + np.exp(-xmat))
+
+    def _h(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        return np.trace(slin.expm(wmat * wmat)) - d_cols
+
+    def _func(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        sig = sigmoid(np.dot(xmat, wmat))
+        loss = (1. / n_rows) * np.sum(-np.diag((xmat.T).dot(np.log(sig)))
+                                      - np.diag(((1 - xmat).T).dot(np.log(1 - sig))))
+        h_val = _h(wmat)
+        return loss + 0.5 * rho * h_val * h_val + alpha * h_val + lambda1 * np.sum(np.abs(wmat))
+
+    def _grad(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        sig = sigmoid(np.dot(xmat, wmat))
+        loss_grad = 1.0 / n_rows * (xmat.T).dot(sig - xmat)
+        exp_hdmrd = slin.expm(wmat * wmat)
+        obj_grad = loss_grad + (rho * (np.trace(exp_hdmrd) - d_cols) + alpha) * exp_hdmrd.T * wmat * 2
+        return obj_grad.flatten() + np.where(wmat >= 0, lambda1, -lambda1).flatten()
+
+    n_rows, d_cols = xmat.shape
+    w_est, w_new = np.zeros(d_cols * d_cols), np.zeros(d_cols * d_cols)
+    rho, alpha, h_val, h_new = 1.0, 0.0, np.inf, np.inf
+    bnds = [(0, 0) if i == j else (None, None) for i in range(d_cols) for j in range(d_cols)]
+    for n_iter in range(max_iter):
+        while rho < 1e+20:
+            sol = sopt.minimize(_func, w_est, method='L-BFGS-B', jac=_grad, bounds=bnds)
+            w_new = sol.x
+            h_new = _h(w_new)
+            if h_new > 0.25 * h_val:
+                rho *= 10
+            else:
+                break
+        w_est, h_val = w_new, h_new
+        alpha += rho * h_val
+        if h_val <= h_tol:
+            break
+        if h_val > h_tol and n_iter == max_iter - 1:
+            warnings.warn("Failed to converge. Consider increasing max_iter.")
+
+    w_est[np.abs(w_est) < w_threshold] = 0
+    return w_est.reshape([d_cols, d_cols])
