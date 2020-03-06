@@ -54,6 +54,155 @@ from causalnex.structure.structuremodel import StructureModel
 __all__ = ["from_numpy", "from_pandas", "from_numpy_lasso", "from_pandas_lasso"]
 
 
+# TODO can be removed when ready to actually modify; verified behaves same as _learn_structure
+def notears_simple(xmat: np.ndarray,
+                   max_iter: int = 100,
+                   h_tol: float = 1e-8,
+                   w_threshold: float = 0.3) -> np.ndarray:
+    """Solve min_wmat ell(wmat; xmat) s.t. h_val(wmat) = 0 using augmented Lagrangian.
+    Args:
+        xmat: [n_rows,d_cols] sample matrix
+        max_iter: max number of dual ascent steps
+        h_tol: exit if |h_exp(w_vec)| <= h_tol
+        w_threshold: fixed threshold for edge weights
+    Returns:
+        wmat_est: [d_cols,d_cols] estimate
+    """
+
+    def h_exp(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        return np.trace(slin.expm(wmat * wmat)) - d_cols
+
+    def _func(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        loss = 0.5 / n_rows * np.square(np.linalg.norm(xmat.dot(np.eye(d_cols, d_cols) - wmat), 'fro'))
+        h_val = h_exp(wmat)
+        return loss + 0.5 * rho * h_val * h_val + alpha * h_val
+
+    def _grad(w_vec):
+        wmat = w_vec.reshape([d_cols, d_cols])
+        loss_grad = - 1.0 / n_rows * xmat.T.dot(xmat).dot(np.eye(d_cols, d_cols) - wmat)
+        exp_hdmrd = slin.expm(wmat * wmat)
+        obj_grad = loss_grad + (rho * (np.trace(exp_hdmrd) - d_cols) + alpha) * exp_hdmrd.T * wmat * 2
+        return obj_grad.flatten()
+
+    n_rows, d_cols = xmat.shape
+    w_est, w_new = np.zeros(d_cols * d_cols), np.zeros(d_cols * d_cols)
+    rho, alpha, h_val, h_new = 1.0, 0.0, np.inf, np.inf
+    bnds = [(0, 0) if i == j else (None, None) for i in range(d_cols) for j in range(d_cols)]
+    for n_iter in range(max_iter):
+        while rho < 1e+20:
+            sol = sopt.minimize(_func, w_est, method='L-BFGS-B', jac=_grad, bounds=bnds)
+            w_new = sol.x
+            h_new = h_exp(w_new)
+            if h_new > 0.25 * h_val:
+                rho *= 10
+            else:
+                break
+        w_est, h_val = w_new, h_new
+        alpha += rho * h_val
+        if h_val <= h_tol:
+            break
+        if h_val > h_tol and n_iter == max_iter - 1:
+            warnings.warn("Failed to converge. Consider increasing max_iter.")
+    # print(_func(w_est))
+    w_est[np.abs(w_est) < w_threshold] = 0
+    return w_est.reshape([d_cols, d_cols])
+
+
+def _learn_structure(
+    X: np.ndarray,
+    beta: float = None,
+    bnds = None,
+    max_iter: int = 100,
+    h_tol: float = 1e-8,
+    w_threshold: float = 0.0,
+) -> StructureModel:
+    """
+    Based on initial implementation at https://github.com/xunzheng/notears
+    """
+
+    def _h(w: np.ndarray) -> float:
+        """
+        Constraint function of the NOTEARS algorithm.
+
+        Args:
+            w:  current adjacency matrix.
+
+        Returns:
+            float: DAGness of the adjacency matrix (0 == DAG, >0 == cyclic).
+        """
+
+        W = w.reshape([d, d])
+        return np.trace(slin.expm(W * W)) - d
+
+    def _func(w: np.ndarray) -> float:
+        """
+        Objective function that the NOTEARS algorithm tries to minimise.
+
+        Args:
+            w: current adjacency matrix.
+
+        Returns:
+            float: objective.
+        """
+
+        W = w.reshape([d, d])
+        loss = 0.5 / n * np.square(np.linalg.norm(X.dot(np.eye(d, d) - W), "fro"))
+        h = _h(W)
+        return loss + 0.5 * rho * h * h + alpha * h
+
+    def _grad(w: np.ndarray) -> np.ndarray:
+        """
+        Gradient function used to compute next step in NOTEARS algorithm.
+
+        Args:
+            w: the current adjacency matrix.
+
+        Returns:
+            np.ndarray: gradient vector.
+        """
+
+        W = w.reshape([d, d])
+        loss_grad = -1.0 / n * X.T.dot(X).dot(np.eye(d, d) - W)
+        E = slin.expm(W * W)
+        obj_grad = loss_grad + (rho * (np.trace(E) - d) + alpha) * E.T * W * 2
+        return obj_grad.flatten()
+
+    if X.size == 0:
+        raise ValueError("Input data X is empty, cannot learn any structure")
+    logging.info("Learning structure using 'NOTEARS' optimisation.")
+
+    # n examples, d properties
+    n, d = X.shape
+    # initialise matrix to zeros
+    w_est, w_new = np.zeros(d * d), np.zeros(d * d)
+
+    # initialise weights and constraints
+    rho, alpha, h, h_new = 1.0, 0.0, np.inf, np.inf
+
+    # start optimisation
+    for n_iter in range(max_iter):
+        while rho < 1e20:
+            sol = sopt.minimize(_func, w_est, method="L-BFGS-B", jac=_grad, bounds=bnds)
+            w_new = sol.x
+            h_new = _h(w_new)
+            if h_new > 0.25 * h:
+                rho *= 10
+            else:
+                break
+        w_est, h = w_new, h_new
+        alpha += rho * h
+        if h <= h_tol:
+            break
+        if h > h_tol and n_iter == max_iter - 1:
+            warnings.warn("Failed to converge. Consider increasing max_iter.")
+
+    w_est[np.abs(w_est) <= w_threshold] = 0
+    print("Using _learn_structure")
+    return StructureModel(w_est.reshape([d, d]))
+
+
 def from_numpy(
     X: np.ndarray,
     max_iter: int = 100,
@@ -62,6 +211,9 @@ def from_numpy(
     tabu_edges: List[Tuple[int, int]] = None,
     tabu_parent_nodes: List[int] = None,
     tabu_child_nodes: List[int] = None,
+    learn_func =_learn_structure,
+    c_cols = None,
+    bin_list=None,
 ) -> StructureModel:
     """
     Learn the `StructureModel`, the graph structure describing conditional dependencies between variables
@@ -116,7 +268,16 @@ def from_numpy(
         for j in range(d)
     ]
 
-    return _learn_structure(X, bnds, max_iter, h_tol, w_threshold)
+    # return _learn_structure(X, bnds, max_iter, h_tol, w_threshold)
+    if c_cols is None:
+        if bin_list is None:
+            return learn_func(X, bnds=bnds, max_iter=max_iter, h_tol=h_tol, w_threshold=w_threshold)
+        else:
+            print("running notears_combo w c_cols= {}".format(c_cols))
+            return notears_combo_handle_shuff(X, max_iter=max_iter, bin_list=bin_list, h_tol=h_tol, w_threshold=w_threshold)
+    else:
+        print("running notears_combo w c_cols= {}".format(c_cols))
+        return notears_combo(X, max_iter=max_iter, c_cols=c_cols, h_tol=h_tol, w_threshold=w_threshold)
 
 
 def from_numpy_lasso(
@@ -349,97 +510,6 @@ def from_pandas_lasso(
     return sm
 
 
-def _learn_structure(
-    X: np.ndarray,
-    bnds,
-    max_iter: int = 100,
-    h_tol: float = 1e-8,
-    w_threshold: float = 0.0,
-) -> StructureModel:
-    """
-    Based on initial implementation at https://github.com/xunzheng/notears
-    """
-
-    def _h(w: np.ndarray) -> float:
-        """
-        Constraint function of the NOTEARS algorithm.
-
-        Args:
-            w:  current adjacency matrix.
-
-        Returns:
-            float: DAGness of the adjacency matrix (0 == DAG, >0 == cyclic).
-        """
-
-        W = w.reshape([d, d])
-        return np.trace(slin.expm(W * W)) - d
-
-    def _func(w: np.ndarray) -> float:
-        """
-        Objective function that the NOTEARS algorithm tries to minimise.
-
-        Args:
-            w: current adjacency matrix.
-
-        Returns:
-            float: objective.
-        """
-
-        W = w.reshape([d, d])
-        loss = 0.5 / n * np.square(np.linalg.norm(X.dot(np.eye(d, d) - W), "fro"))
-        h = _h(W)
-        return loss + 0.5 * rho * h * h + alpha * h
-
-    def _grad(w: np.ndarray) -> np.ndarray:
-        """
-        Gradient function used to compute next step in NOTEARS algorithm.
-
-        Args:
-            w: the current adjacency matrix.
-
-        Returns:
-            np.ndarray: gradient vector.
-        """
-
-        W = w.reshape([d, d])
-        loss_grad = -1.0 / n * X.T.dot(X).dot(np.eye(d, d) - W)
-        E = slin.expm(W * W)
-        obj_grad = loss_grad + (rho * (np.trace(E) - d) + alpha) * E.T * W * 2
-        return obj_grad.flatten()
-
-    if X.size == 0:
-        raise ValueError("Input data X is empty, cannot learn any structure")
-    logging.info("Learning structure using 'NOTEARS' optimisation.")
-
-    # n examples, d properties
-    n, d = X.shape
-    # initialise matrix to zeros
-    w_est, w_new = np.zeros(d * d), np.zeros(d * d)
-
-    # initialise weights and constraints
-    rho, alpha, h, h_new = 1.0, 0.0, np.inf, np.inf
-
-    # start optimisation
-    for n_iter in range(max_iter):
-        while rho < 1e20:
-            sol = sopt.minimize(_func, w_est, method="L-BFGS-B", jac=_grad, bounds=bnds)
-            w_new = sol.x
-            h_new = _h(w_new)
-            if h_new > 0.25 * h:
-                rho *= 10
-            else:
-                break
-        w_est, h = w_new, h_new
-        alpha += rho * h
-        if h <= h_tol:
-            break
-        if h > h_tol and n_iter == max_iter - 1:
-            warnings.warn("Failed to converge. Consider increasing max_iter.")
-
-    w_est[np.abs(w_est) <= w_threshold] = 0
-    return StructureModel(w_est.reshape([d, d]))
-
-
 def _learn_structure_lasso(
     X: np.ndarray,
     beta: float,
@@ -529,11 +599,11 @@ def _learn_structure_lasso(
     n, d = X.shape
     w_est, w_new = np.zeros(2 * d * d), np.zeros(2 * d * d)
     rho, alpha, h_val, h_new = 1.0, 0.0, np.inf, np.inf
+
     for n_iter in range(max_iter):
         while rho < 1e20:
             sol = sopt.minimize(_func, w_est, method="L-BFGS-B", jac=_grad, bounds=bnds)
             w_new = sol.x
-
             h_new = _h(
                 w_new[: d ** 2].reshape([d, d]) - w_new[d ** 2 :].reshape([d, d])
             )
@@ -555,86 +625,9 @@ def _learn_structure_lasso(
 
 ## Shaan's functions
 
-def notears_l1(xmat: np.ndarray,
-               max_iter: int = 100,
-               h_tol: float = 1e-8,
-               w_threshold: float = 0.3,
-               lambda_1: float = 0.1) -> np.ndarray:
-    """Solve min_wmat ell(wmat; xmat) s.t. h_val(wmat) = 0 using augmented Lagrangian.
-    Args:
-        xmat: [n_rows,d_cols] sample matrix
-        max_iter: max number of dual ascent steps
-        h_tol: exit if |h_exp(w_vec)| <= h_tol
-        w_threshold: fixed threshold for edge weights
-        lambda_1: coefficient of l1 regularisation
-    Returns:
-        wmat_est: [d_cols,d_cols] estimate
-    """
-
-    def _h(w_vec):
-        wmat = w_vec.reshape([d_cols, d_cols])
-        return np.trace(slin.expm(wmat * wmat)) - d_cols
-
-    def _func(w_vec):
-        w_pos = w_vec[:d_cols ** 2]
-        w_neg = w_vec[d_cols ** 2:]
-
-        wmat_pos = w_pos.reshape([d_cols, d_cols])
-        wmat_neg = w_neg.reshape([d_cols, d_cols])
-
-        wmat = wmat_pos - wmat_neg
-
-        loss = 0.5 / n_rows * np.square(np.linalg.norm(xmat.dot(np.eye(d_cols, d_cols) - wmat), 'fro'))
-        h_val = _h(wmat)
-        return loss + 0.5 * rho * h_val * h_val + alpha * h_val + lambda_1 * np.linalg.norm(wmat.ravel(), 1)
-
-    def _grad(w_vec):
-        w_pos = w_vec[:d_cols ** 2]
-        w_neg = w_vec[d_cols ** 2:]
-
-        grad_vec = np.zeros(2 * d_cols ** 2)
-        wmat_pos = w_pos.reshape([d_cols, d_cols])
-        wmat_neg = w_neg.reshape([d_cols, d_cols])
-
-        wmat = wmat_pos - wmat_neg
-
-        loss_grad = - 1.0 / n_rows * xmat.T.dot(xmat).dot(np.eye(d_cols, d_cols) - wmat)
-        exp_hdmrd = slin.expm(wmat * wmat)
-        obj_grad = loss_grad + (rho * (np.trace(exp_hdmrd) - d_cols) + alpha) * exp_hdmrd.T * wmat * 2
-        lbd_grad = lambda_1 * np.ones(d_cols * d_cols)
-        grad_vec[:d_cols ** 2] = obj_grad.flatten() + lbd_grad
-        grad_vec[d_cols ** 2:] = -obj_grad.flatten() + lbd_grad
-        return grad_vec
-
-    n_rows, d_cols = xmat.shape
-    w_est, w_new = np.zeros(2 * d_cols * d_cols), np.zeros(2 * d_cols * d_cols)
-    rho, alpha, h_val, h_new = 1.0, 0.0, np.inf, np.inf
-    bnds = [(0, 0) if i == j else (0, None) for i in range(d_cols) for j in range(d_cols)] * 2
-    for n_iter in range(max_iter):
-        while rho < 1e+20:
-            sol = sopt.minimize(_func, w_est, method='L-BFGS-B', jac=_grad, bounds=bnds)
-            w_new = sol.x
-
-            h_new = _h(w_new[:d_cols ** 2].reshape([d_cols, d_cols]) - w_new[d_cols ** 2:].reshape([d_cols, d_cols]))
-            if h_new > 0.25 * h_val:
-                rho *= 10
-            else:
-                break
-        w_est, h_val = w_new, h_new
-        alpha += rho * h_val
-        if h_val <= h_tol:
-            break
-        if h_val > h_tol and n_iter == max_iter - 1:
-            warnings.warn("Failed to converge. Consider increasing max_iter.")
-
-    # print(_func(w_est))
-    # print(n_iter)
-    w_new = w_est[:d_cols ** 2].reshape([d_cols, d_cols]) - w_est[d_cols ** 2:].reshape([d_cols, d_cols])
-    w_new[np.abs(w_new) < w_threshold] = 0
-    return w_new
-
-
+# try dis
 def notears_binary(xmat: np.ndarray,
+                   bnds=None,
                    max_iter: int = 100,
                    h_tol: float = 1e-8,
                    w_threshold: float = 0.3) -> np.ndarray:
@@ -692,7 +685,7 @@ def notears_binary(xmat: np.ndarray,
             warnings.warn("Failed to converge. Consider increasing max_iter.")
 
     w_est[np.abs(w_est) < w_threshold] = 0
-    return w_est.reshape([d_cols, d_cols])
+    return StructureModel(w_est.reshape([d_cols, d_cols]))
 
 
 # pylint: disable=too-many-locals
@@ -770,7 +763,36 @@ def notears_combo(xmat: np.ndarray,
             warnings.warn("Failed to converge. Consider increasing max_iter.")
 
     w_est[np.abs(w_est) < w_threshold] = 0
-    return w_est.reshape([d_cols, d_cols])
+    return StructureModel(w_est.reshape([d_cols, d_cols]))
+
+
+# pylint: disable=too-many-locals
+def notears_combo_handle_shuff(xmat: np.ndarray,
+                  max_iter: int = 100,
+                  bin_list: list = None,
+                  h_tol: float = 1e-8,
+                  w_threshold: float = 0.3) -> np.ndarray:
+    """
+    Wrapper to rearrange a matrix and feed into combo solver. Jank AF, maybe don't do this
+    in production
+    """
+
+    def separate_matrices(xmat, bin_list):
+        cont_list = [i for i in range(0, xmat.shape[1]) if i not in bin_list]
+
+        # TODO: would be good to have error-checking here that the
+        # resulting matrices have value types as expected
+        xmat_c = xmat[:, cont_list]  # continuous
+        xmat_b = xmat[:, bin_list]   # binary
+
+        return xmat_c, xmat_b, cont_list
+
+    # re-concat matrices and feed back - this is honestly quite silly
+    xmat_c, xmat_b, cont_list = separate_matrices(xmat, bin_list)
+    X = np.concatenate((xmat_c, xmat_b), axis=1)
+    c_cols = xmat_c.shape[1]
+
+    return notears_combo(xmat=X, c_cols=c_cols, max_iter=max_iter, h_tol=h_tol, w_threshold=w_threshold)
 
 
 def notears_binary_l1(xmat: np.ndarray,
@@ -833,4 +855,4 @@ def notears_binary_l1(xmat: np.ndarray,
             warnings.warn("Failed to converge. Consider increasing max_iter.")
 
     w_est[np.abs(w_est) < w_threshold] = 0
-    return w_est.reshape([d_cols, d_cols])
+    return StructureModel(w_est.reshape([d_cols, d_cols]))

@@ -103,6 +103,9 @@ class StructureModel(nx.DiGraph):
         for u_of_edge, v_of_edge in self.edges:
             self[u_of_edge][v_of_edge]["origin"] = origin
 
+        if isinstance(incoming_graph_data, np.ndarray):
+            self.original_ndarray = incoming_graph_data
+
     def to_directed_class(self):
         """
         Returns the class to use for directed copies.
